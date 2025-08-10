@@ -1,0 +1,23 @@
+import random
+
+def build_markov_chain(text, n=1):
+    words = text.split()
+    chain = {}
+    for i in range(len(words) - n):
+        key = tuple(words[i:i+n])
+        next_word = words[i+n]
+        chain.setdefault(key, []).append(next_word)
+    return chain
+
+def generate_text(chain, length=20):
+    key = random.choice(list(chain.keys()))
+    result = list(key)
+    for _ in range(length - len(key)):
+        next_word = random.choice(chain.get(key, [""]))
+        result.append(next_word)
+        key = tuple(result[-len(key):])
+    return ' '.join(result)
+
+text = "I love AI. AI is amazing. AI can write code. Code can create amazing things."
+chain = build_markov_chain(text, n=2)
+print(generate_text(chain, length=15))
