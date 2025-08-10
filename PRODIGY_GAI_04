@@ -1,0 +1,156 @@
+import os
+import random
+from glob import glob
+from PIL import Image
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+import torch.nn.functional as F
+from torchvision.utils import save_image
+
+# ---------- Dataset ----------
+class PairedImageDataset(Dataset):
+    def __init__(self, a_dir, b_dir, size=256):
+        self.a_paths = sorted(glob(os.path.join(a_dir, "*")))
+        self.b_paths = sorted(glob(os.path.join(b_dir, "*")))
+        assert len(self.a_paths) == len(self.b_paths)
+        self.transform = T.Compose([
+            T.Resize((size, size)),
+            T.ToTensor(),
+            T.Normalize([0.5]*3, [0.5]*3)
+        ])
+    def __len__(self):
+        return len(self.a_paths)
+    def __getitem__(self, idx):
+        a = Image.open(self.a_paths[idx]).convert("RGB")
+        b = Image.open(self.b_paths[idx]).convert("RGB")
+        return self.transform(a), self.transform(b)
+
+# ---------- Models ----------
+# Basic conv block
+def conv(in_c, out_c, k=4, s=2, p=1, norm=True, activation=nn.LeakyReLU(0.2, inplace=True)):
+    layers = [nn.Conv2d(in_c, out_c, k, s, p, bias=not norm)]
+    if norm: layers.append(nn.BatchNorm2d(out_c))
+    if activation: layers.append(activation)
+    return nn.Sequential(*layers)
+
+# U-Net generator (down + up with skip connections)
+class UNetGenerator(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, ngf=64):
+        super().__init__()
+        # encoder
+        self.enc1 = conv(in_ch, ngf, norm=False)          # 128
+        self.enc2 = conv(ngf, ngf*2)                      # 64
+        self.enc3 = conv(ngf*2, ngf*4)                    # 32
+        self.enc4 = conv(ngf*4, ngf*8)                    # 16
+        self.enc5 = conv(ngf*8, ngf*8)                    # 8
+        self.enc6 = conv(ngf*8, ngf*8)                    # 4
+        self.enc7 = conv(ngf*8, ngf*8)                    # 2
+        self.enc8 = conv(ngf*8, ngf*8, norm=False)        # 1
+        # decoder (transpose convs)
+        def deconv(in_c, out_c, dropout=False):
+            layers = [nn.ConvTranspose2d(in_c, out_c, 4, 2, 1, bias=False),
+                      nn.BatchNorm2d(out_c),
+                      nn.ReLU(True)]
+            if dropout: layers.append(nn.Dropout(0.5))
+            return nn.Sequential(*layers)
+        self.dec1 = deconv(ngf*8, ngf*8, True)
+        self.dec2 = deconv(ngf*16, ngf*8, True)
+        self.dec3 = deconv(ngf*16, ngf*8, True)
+        self.dec4 = deconv(ngf*16, ngf*8)
+        self.dec5 = deconv(ngf*16, ngf*4)
+        self.dec6 = deconv(ngf*8, ngf*2)
+        self.dec7 = deconv(ngf*4, ngf)
+        self.dec8 = nn.Sequential(
+            nn.ConvTranspose2d(ngf*2, out_ch, 4, 2, 1),
+            nn.Tanh()
+        )
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        e5 = self.enc5(e4)
+        e6 = self.enc6(e5)
+        e7 = self.enc7(e6)
+        e8 = self.enc8(e7)
+        d1 = self.dec1(e8); d1 = torch.cat([d1, e7], 1)
+        d2 = self.dec2(d1); d2 = torch.cat([d2, e6], 1)
+        d3 = self.dec3(d2); d3 = torch.cat([d3, e5], 1)
+        d4 = self.dec4(d3); d4 = torch.cat([d4, e4], 1)
+        d5 = self.dec5(d4); d5 = torch.cat([d5, e3], 1)
+        d6 = self.dec6(d5); d6 = torch.cat([d6, e2], 1)
+        d7 = self.dec7(d6); d7 = torch.cat([d7, e1], 1)
+        out = self.dec8(d7)
+        return out
+
+# PatchGAN discriminator
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_ch=6, ndf=64):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_ch, ndf, 4, 2, 1), nn.LeakyReLU(0.2, True),        # 128
+            conv(ndf, ndf*2),                                               # 64
+            conv(ndf*2, ndf*4),                                             # 32
+            conv(ndf*4, ndf*8, s=1, p=1),                                   # 31
+            nn.Conv2d(ndf*8, 1, 4, 1, 1)                                    # output patch
+        )
+    def forward(self, a, b):
+        x = torch.cat([a, b], 1)
+        return self.model(x)
+
+# ---------- Training ----------
+def train(data_root_a="data/train/A", data_root_b="data/train/B",
+          epochs=20, batch_size=4, lr=2e-4, device="cuda" if torch.cuda.is_available() else "cpu"):
+    ds = PairedImageDataset(data_root_a, data_root_b, size=256)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+    G = UNetGenerator().to(device)
+    D = PatchDiscriminator().to(device)
+    optG = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
+    optD = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
+    bce = nn.BCEWithLogitsLoss()
+    l1 = nn.L1Loss()
+    lambda_l1 = 100.0
+
+    for epoch in range(epochs):
+        for i, (a, b) in enumerate(loader):
+            a = a.to(device); b = b.to(device)
+            # ---- Discriminator ----
+            fake_b = G(a)
+            D_real = D(a, b)
+            D_fake = D(a, fake_b.detach())
+            real_label = torch.ones_like(D_real, device=device)
+            fake_label = torch.zeros_like(D_fake, device=device)
+            lossD = bce(D_real, real_label) + bce(D_fake, fake_label)
+            optD.zero_grad(); lossD.backward(); optD.step()
+
+            # ---- Generator ----
+            D_fake_for_G = D(a, fake_b)
+            gan_loss = bce(D_fake_for_G, real_label)          # try to fool D
+            l1_loss = l1(fake_b, b) * lambda_l1
+            lossG = gan_loss + l1_loss
+            optG.zero_grad(); lossG.backward(); optG.step()
+
+            if i % 50 == 0:
+                print(f"Epoch[{epoch}/{epochs}] Iter[{i}/{len(loader)}] LossD:{lossD.item():.4f} LossG:{lossG.item():.4f}")
+
+        # save sample
+        G.eval()
+        with torch.no_grad():
+            a_sample, b_sample = ds[0]
+            pred = G(a_sample.unsqueeze(0).to(device))
+            sample = torch.cat([a_sample.unsqueeze(0), pred.cpu(), b_sample.unsqueeze(0)], dim=0)
+            save_image((sample + 1) * 0.5, f"sample_epoch{epoch}.png", nrow=3)
+        G.train()
+
+    # final save
+    torch.save(G.state_dict(), "pix2pix_G.pth")
+    torch.save(D.state_dict(), "pix2pix_D.pth")
+    print("Training finished. Models saved.")
+
+if __name__ == "__main__":
+    # adjust these paths to your dataset
+    train(data_root_a="data/train/A", data_root_b="data/train/B",
+          epochs=10, batch_size=2)
